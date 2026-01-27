@@ -29,6 +29,12 @@ using Wabbajack.LoginManagers;
 using Wabbajack.Downloaders;
 using Wabbajack.DTOs.DownloadStates;
 using System.Reactive.Concurrency;
+using FileMode = System.IO.FileMode;
+using Wabbajack.Networking.Http.Interfaces;
+using Wabbajack.DTOs.Logins;
+using System.Net.Http;
+using System.IO;
+using System.IO.Compression;
 
 namespace Wabbajack;
 
@@ -38,6 +44,9 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
     private readonly ResourceMonitor _resourceMonitor;
     private readonly IEnumerable<INeedsLogin> _logins;
     private readonly DownloadDispatcher _downloadDispatcher;
+
+    private readonly ITokenProvider<NexusOAuthState> _nexusTokenProvider;
+    private readonly HttpClient _httpClient;
 
     public CompilerDetailsVM CompilerDetailsVM { get; set; }
     public CompilerFileManagerVM CompilerFileManagerVM { get; set; }
@@ -51,29 +60,64 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
     public ICommand OpenLogCommand { get; }
     public ICommand OpenFolderCommand { get; }
     public ICommand PublishCommand { get; }
+    public ICommand PublishCollectionCommand { get; }
+
+    public ICommand RefreshPreflightChecksCommand { get; }
 
     [Reactive] public bool IsPublishing { get; set; }
+    [Reactive] public bool IsPublishingCollection { get; set; }
     [Reactive] public Percent PublishingPercentage { get; set; } = Percent.One;
     [Reactive] public CompilerState State { get; set; }
+    [Reactive] public string BusyStatusText { get; set; } = "";
+
+    [Reactive] public bool? PreflightChecksPassed { get; set; } = null;
+    [Reactive] public string PreflightCheckMessage { get; set; } = "";
+
+    public bool IsBusy => IsPublishing || IsPublishingCollection;
 
     public bool Cancelling { get; private set; }
 
     public ReadOnlyObservableCollection<CPUDisplayVM> StatusList => _resourceMonitor.Tasks;
 
-    public CompilerMainVM(ILogger<CompilerMainVM> logger, DTOSerializer dtos, SettingsManager settingsManager,
-        LogStream loggerProvider, Client wjClient, IServiceProvider serviceProvider, ResourceMonitor resourceMonitor,
-        CompilerDetailsVM compilerDetailsVM, CompilerFileManagerVM compilerFileManagerVM, IEnumerable<INeedsLogin> logins, DownloadDispatcher downloadDispatcher) : base(dtos, settingsManager, logger, wjClient)
+    public enum PublishCollectionResult
+    {
+        None = 0,
+        Success = 1,
+        Failed = 2
+    }
+
+    [Reactive] public PublishCollectionResult PublishCollectionLastResult { get; set; } = PublishCollectionResult.None;
+
+    public CompilerMainVM(
+        ILogger<CompilerMainVM> logger,
+        DTOSerializer dtos,
+        SettingsManager settingsManager,
+        LogStream loggerProvider,
+        Client wjClient,
+        IServiceProvider serviceProvider,
+        ResourceMonitor resourceMonitor,
+        CompilerDetailsVM compilerDetailsVM,
+        CompilerFileManagerVM compilerFileManagerVM,
+        IEnumerable<INeedsLogin> logins,
+        DownloadDispatcher downloadDispatcher,
+        ITokenProvider<NexusOAuthState> nexusTokenProvider,
+        HttpClient httpClient
+    ) : base(dtos, settingsManager, logger, wjClient)
     {
         _serviceProvider = serviceProvider;
         _resourceMonitor = resourceMonitor;
         _logins = logins;
         _downloadDispatcher = downloadDispatcher;
 
+        _nexusTokenProvider = nexusTokenProvider;
+        _httpClient = httpClient;
+
         LoggerProvider = loggerProvider;
         CompilerDetailsVM = compilerDetailsVM;
         CompilerFileManagerVM = compilerFileManagerVM;
 
         GetHelpCommand = ReactiveCommand.Create(GetHelp);
+
         StartCommand = ReactiveCommand.Create(StartCompilation,
             this.WhenAnyValue(vm => vm.Settings.ModListName,
                               vm => vm.Settings.ModListAuthor,
@@ -81,22 +125,41 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
                               vm => vm.Settings.ModListImage,
                               vm => vm.Settings.Downloads,
                               vm => vm.Settings.OutputFile,
-                              vm => vm.Settings.Version, (name, author, desc, img, downloads, output, version) => 
-                              !string.IsNullOrWhiteSpace(name) &&
-                              !string.IsNullOrWhiteSpace(author) &&
-                              !string.IsNullOrWhiteSpace(desc) &&
-                              img.FileExists() &&
-                              !string.IsNullOrEmpty(downloads.ToString()) &&
-                              !string.IsNullOrEmpty(output.ToString()) && output.Extension == Ext.Wabbajack &&
-                              Version.TryParse(version, out _)));
+                              vm => vm.Settings.Version,
+                              (name, author, desc, img, downloads, output, version) =>
+                                  !string.IsNullOrWhiteSpace(name) &&
+                                  !string.IsNullOrWhiteSpace(author) &&
+                                  !string.IsNullOrWhiteSpace(desc) &&
+                                  img.FileExists() &&
+                                  !string.IsNullOrEmpty(downloads.ToString()) &&
+                                  !string.IsNullOrEmpty(output.ToString()) && output.Extension == Ext.Wabbajack &&
+                                  Version.TryParse(version, out _)));
 
         CancelCommand = ReactiveCommand.Create(CancelCompilation);
         OpenLogCommand = ReactiveCommand.Create(OpenLog);
         OpenFolderCommand = ReactiveCommand.Create(OpenFolder);
+
         PublishCommand = ReactiveCommand.Create(Publish,
             this.WhenAnyValue(vm => vm.State,
                               vm => vm.IsPublishing,
-                              (state, isPublishing) => !isPublishing && state == CompilerState.Completed)); 
+                              vm => vm.IsPublishingCollection,
+                              vm => vm.PreflightChecksPassed,
+                              (state, isPublishing, isPublishingCollection, preflightPassed) =>
+                                  !isPublishing && !isPublishingCollection &&
+                                  state == CompilerState.Completed &&
+                                  preflightPassed == true));
+
+        PublishCollectionCommand = ReactiveCommand.CreateFromTask(PublishCollection,
+            this.WhenAnyValue(vm => vm.State,
+                              vm => vm.IsPublishing,
+                              vm => vm.IsPublishingCollection,
+                              vm => vm.PreflightChecksPassed,
+                              (state, isPublishing, isPublishingCollection, preflightPassed) =>
+                                  !isPublishing && !isPublishingCollection &&
+                                  state == CompilerState.Completed &&
+                                  preflightPassed == true));
+
+        RefreshPreflightChecksCommand = ReactiveCommand.CreateFromTask(async () => await RunPreflightChecksAsync());
 
         ProgressPercent = Percent.Zero;
 
@@ -132,6 +195,11 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
             this.WhenAnyValue(x => x.CompilerFileManagerVM.Settings.AlwaysEnabled)
                 .BindTo(this, x => x.Settings.AlwaysEnabled)
                 .DisposeWith(disposables);
+            this.WhenAnyValue(x => x.State)
+                .Where(s => s == CompilerState.Completed)
+                .Subscribe(async _ => await RunPreflightChecksAsync())
+                .DisposeWith(disposables);
+
         });
     }
 
@@ -145,19 +213,20 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
     {
         try
         {
+            BusyStatusText = "Publishing modlist...";
             IsPublishing = true;
+
             PublishingPercentage = Percent.Zero;
 
-            _logger.LogInformation("Running preflight checks before publishing list");
-            bool readyForPublish = await RunPreflightChecks(CancellationToken.None);
-            if (!readyForPublish) return;
-
-            _logger.LogInformation("Publishing list with machineURL {machineURL}, version {version}, output {output}",
-                Settings.MachineUrl, Settings.Version, Settings.OutputFile);
 
             var downloadMetadata = _dtos.Deserialize<DownloadMetadata>(
                 await Settings.OutputFile.WithExtension(Ext.Meta).WithExtension(Ext.Json).ReadAllTextAsync())!;
-            var (progress, publishTask) = await _wjClient.PublishModlist(Settings.MachineUrl, Version.Parse(Settings.Version), Settings.OutputFile, downloadMetadata);
+            var (progress, publishTask) = await _wjClient.PublishModlist(
+                Settings.MachineUrl,
+                Version.Parse(Settings.Version),
+                Settings.OutputFile,
+                downloadMetadata);
+
             using var progressSubscription = progress.Subscribe(p => PublishingPercentage = p.PercentDone);
             await publishTask;
         }
@@ -169,6 +238,7 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
         {
             IsPublishing = false;
             PublishingPercentage = Percent.One;
+            BusyStatusText = "";
         }
     }
 
@@ -215,7 +285,6 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
                         });
                     });
 
-
                 try
                 {
                     CancellationTokenSource = new CancellationTokenSource();
@@ -241,8 +310,6 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
                     ProgressState = ProgressState.Success;
                     return Disposable.Empty;
                 });
-
-
             }
             catch (Exception ex)
             {
@@ -274,6 +341,168 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
         await tsk;
     }
 
+    private async Task RunPreflightChecksAsync()
+    {
+        try
+        {
+            _logger.LogInformation("Running preflight checks...");
+            PreflightCheckMessage = "Running checks...";
+            PreflightChecksPassed = null;
+
+            var passed = await RunPreflightChecks(CancellationToken.None);
+
+            PreflightChecksPassed = passed;
+            PreflightCheckMessage = passed
+                ? "Ready to publish"
+                : $"Checks failed: List '{Settings.MachineUrl}' not found in repository or invalid version";
+
+            _logger.LogInformation("Preflight checks {status}", passed ? "passed" : "failed");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error running preflight checks");
+            PreflightChecksPassed = false;
+            PreflightCheckMessage = "Checks failed: " + ex.Message;
+        }
+    }
+
+    private async Task PublishCollection()
+    {
+        try
+        {
+            BusyStatusText = "Creating Nexus Mods collection page...";
+            PublishCollectionLastResult = PublishCollectionResult.None;
+            IsPublishingCollection = true;
+
+            ModList modList;
+
+            await using (var fs = Settings.OutputFile.Open(FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var za = new ZipArchive(fs, ZipArchiveMode.Read))
+            {
+                var entry = za.GetEntry("modlist");
+                if (entry == null)
+                {
+                    _logger.LogError("Cannot publish collection: 'modlist' entry not found in {output}", Settings.OutputFile);
+                    PublishCollectionLastResult = PublishCollectionResult.Failed;
+                    return;
+                }
+
+                using var es = entry.Open();
+                using var sr = new StreamReader(es);
+                var modListJson = await sr.ReadToEndAsync();
+                modList = _dtos.Deserialize<ModList>(modListJson)!;
+            }
+
+            var vortexJson = WabbajackToVortexCollection.Serialize(modList);
+            var collectionJsonPath = Settings.OutputFile.WithExtension(new Extension(".collection.json"));
+            await collectionJsonPath.WriteAllTextAsync(vortexJson);
+
+            var uploader = new NexusCollectionUploader(
+                _logger,
+                _nexusTokenProvider,
+                _httpClient,
+                _dtos.Options
+            );
+
+            var listDomain = WabbajackToVortexCollection.GetDomain(modList.GameType.ToString());
+
+            // Load stored mapping from the author's modlists.json
+            int? existingCollectionId = null;
+            string? existingSlug = null;
+            string? existingDomain = null;
+
+            try
+            {
+                var mapping = await _wjClient.GetNexusCollectionMapping(Settings.MachineUrl, CancellationToken.None);
+                if (mapping != null && mapping.CollectionId > 0)
+                {
+                    existingCollectionId = mapping.CollectionId;
+                    existingSlug = mapping.Slug;
+                    existingDomain = mapping.DomainName;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to read Nexus collection mapping from modlists.json; will create a new collection instead.");
+            }
+
+            if (existingCollectionId.HasValue &&
+                !string.IsNullOrWhiteSpace(existingDomain) &&
+                !existingDomain.Equals(listDomain, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning(
+                    "Stored Nexus mapping domain '{stored}' does not match current list domain '{current}'. Ignoring stored collectionId={id}.",
+                    existingDomain, listDomain, existingCollectionId.Value);
+
+                existingCollectionId = null;
+                existingSlug = null;
+                existingDomain = null;
+            }
+
+            if (existingCollectionId.HasValue)
+                _logger.LogInformation("Using stored Nexus collection mapping: collectionId={id} slug={slug} domain={domain}",
+                    existingCollectionId.Value, existingSlug, existingDomain);
+            else
+                _logger.LogInformation("No stored Nexus collection mapping found; creating new collection.");
+
+            var result = await uploader.UploadCollection(
+                modList,
+                collectionJsonPath,
+                Settings.OutputFile,
+                existingCollectionId: existingCollectionId,
+                CancellationToken.None);
+
+            if (result != null && result.Success)
+            {
+                PublishCollectionLastResult = PublishCollectionResult.Success;
+
+                // put mapping back to the author modlists.json
+                try
+                {
+                    await _wjClient.SetNexusCollectionMapping(
+                        Settings.MachineUrl,
+                        result.CollectionId,
+                        result.Slug,
+                        listDomain,
+                        result.RevisionNumber,
+                        CancellationToken.None);
+
+                    _logger.LogInformation("Persisted Nexus mapping to modlists.json: collectionId={id} slug={slug} domain={domain} rev={rev}",
+                        result.CollectionId, result.Slug, listDomain, result.RevisionNumber);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Collection created/updated, but failed to persist Nexus mapping into modlists.json");
+                }
+
+                try
+                {
+                    var url = $"https://www.nexusmods.com/games/{listDomain}/collections/{result.Slug}/revisions/{result.RevisionNumber}";
+                    Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+                }
+                catch (Exception openEx)
+                {
+                    _logger.LogWarning(openEx, "Failed to open browser for uploaded collection");
+                }
+            }
+            else
+            {
+                PublishCollectionLastResult = PublishCollectionResult.Failed;
+                _logger.LogWarning("Collection upload failed.");
+            }
+        }
+        catch (Exception ex)
+        {
+            PublishCollectionLastResult = PublishCollectionResult.Failed;
+            _logger.LogWarning(ex, "Failed to upload collection to Nexus Mods, this is optional and won't affect your Wabbajack modlist");
+        }
+        finally
+        {
+            IsPublishingCollection = false;
+            BusyStatusText = "";
+        }
+    }
+
     private async Task EnsureLoggedIntoNexus()
     {
         var nexusDownloadState = new Nexus();
@@ -282,6 +511,7 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
             _logger.LogInformation("Preparing {Name}", downloader.GetType().Name);
             if (await downloader.Prepare())
                 continue;
+
             var manager = _logins.FirstOrDefault(l => l.LoginFor() == downloader.GetType());
             if(manager == null)
             {
@@ -325,6 +555,12 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
         try
         {
             lists = await _wjClient.GetMyModlists(token);
+            _logger.LogInformation("Preflight: Retrieved {Count} modlists from server", lists.Count);
+            foreach (var list in lists)
+            {
+                _logger.LogInformation("Preflight: Found list: '{List}'", list);
+            }
+            _logger.LogInformation("Preflight: Looking for MachineUrl: '{MachineUrl}'", Settings.MachineUrl);
         }
         catch(Exception ex)
         {
@@ -332,7 +568,10 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
             return false;
         }
 
-        if (!lists.Any(x => x.Equals(Settings.MachineUrl, StringComparison.InvariantCultureIgnoreCase)))
+        var found = lists.Any(x => x.Equals(Settings.MachineUrl, StringComparison.InvariantCultureIgnoreCase));
+        _logger.LogInformation("Preflight: Match found: {Found}", found);
+
+        if (!found)
         {
             _logger.LogError("Preflight Check failed, list {MachineUrl} not found in any repository", Settings.MachineUrl);
             return false;
