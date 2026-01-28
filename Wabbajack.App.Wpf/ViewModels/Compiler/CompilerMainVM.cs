@@ -54,7 +54,7 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
     public LogStream LoggerProvider { get; }
     public CancellationTokenSource CancellationTokenSource { get; private set; }
 
-    private const bool SKIP_VALIDATION_FOR_TESTING = true;
+    private const bool SKIP_VALIDATION_FOR_TESTING = false;
     public ICommand GetHelpCommand { get; }
     public ICommand StartCommand { get; }
     public ICommand CancelCommand { get; }

@@ -58,6 +58,8 @@
             <Grid x:Name="CompletedButtons" Grid.Row="3" Grid.ColumnSpan="2" Margin="0, 16, 0, 0" HorizontalAlignment="Stretch">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="16" />
+                    <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="2*" />
                     <ColumnDefinition Width="16" />
@@ -72,27 +74,25 @@
                     Grid.Column="0"
                     HorizontalAlignment="Left" />
 
-                <!-- Preflight status message in the middle empty column -->
+                <local:WJButton x:Name="RefreshPreflightButton"
+                    Text="Refresh Checks"
+                    Icon="ArrowClockwise"
+                    Grid.Column="2"
+                    ButtonStyle="Danger"
+                    HorizontalAlignment="Left"
+                    Visibility="Collapsed"/>
+
                 <TextBlock x:Name="PreflightStatusText" 
-                   Grid.Column="1"
+                   Grid.Column="3"
                    Margin="16,5,0,5"
                    VerticalAlignment="Center"
                    TextWrapping="Wrap"
                    HorizontalAlignment="Left"/>
 
-                <!-- Refresh button next to the status text -->
-                <Button x:Name="RefreshPreflightButton"
-                    Grid.Column="1"
-                    Content="Refresh Checks"
-                    Margin="200,0,0,0"
-                    HorizontalAlignment="Left"
-                    VerticalAlignment="Center"
-                    Visibility="Collapsed"/>
-
                 <local:WJButton x:Name="OpenFolderButton"
                     Text="Open in File Explorer"
                     Icon="Folder"
-                    Grid.Column="2"
+                    Grid.Column="4"
                     MinWidth="220"
                     HorizontalAlignment="Stretch"
                     ButtonStyle="Color" />
@@ -101,14 +101,14 @@
                     MinWidth="320"
                     Text="Publish Nexus Mods Collection (experimental)"
                     Icon="CloudArrowUp"
-                    Grid.Column="4"
+                    Grid.Column="6"
                     ButtonStyle="Progress" />
 
                 <local:WJButton x:Name="PublishButton"
                     Text="Publish Modlist"
                     Icon="CloudArrowUp"
                     MinWidth="220"
-                    Grid.Column="6"
+                    Grid.Column="8"
                     HorizontalAlignment="Stretch"
                     ButtonStyle="Progress" />
             </Grid>
