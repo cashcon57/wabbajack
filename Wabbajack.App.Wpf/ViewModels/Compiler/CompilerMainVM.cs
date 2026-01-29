@@ -482,6 +482,7 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
                 collectionJsonPath,
                 Settings.OutputFile,
                 existingCollectionId: existingCollectionId,
+                gameVersion: gameVersion,
                 CancellationToken.None);
 
             if (result != null && result.Success)

@@ -46,10 +46,23 @@ public partial class App
 {
     private IHost _host;
     private TimerResolution? _timerRes;
+    private SingleInstance? _singleInstance;
 
     private void OnStartup(object sender, StartupEventArgs e)
     {
         _timerRes = new TimerResolution(1);
+        _singleInstance = new SingleInstance("Wabbajack-{F8C1E8F0-3E3A-4B3D-9F4A-1E5C6D7E8F9A}");
+
+        if (!_singleInstance.IsFirstInstance)
+        {
+            // Another instance is running - send the args and exit
+            if (e.Args.Length > 0)
+            {
+                SendArgsToRunningInstance(e.Args);
+            }
+            Environment.Exit(0);
+            return;
+        }
         EnsureSafeWorkingDirectoryOrExit();
         if (IsAdmin())
         {
@@ -329,8 +342,27 @@ public partial class App
 
     protected override void OnExit(ExitEventArgs e)
     {
+        _singleInstance?.Dispose();
         _timerRes?.Dispose();
         base.OnExit(e);
+    }
+
+    private void SendArgsToRunningInstance(string[] args)
+    {
+        try
+        {
+            using var pipeClient = new System.IO.Pipes.NamedPipeClientStream(".", "WabbajackProtocolPipe", System.IO.Pipes.PipeDirection.Out);
+            pipeClient.Connect(1000); // 1 second timeout
+
+            using var writer = new System.IO.StreamWriter(pipeClient);
+            writer.WriteLine(string.Join("|", args));
+            writer.Flush();
+        }
+        catch (Exception ex)
+        {
+            // Couldn't send to existing instance just exit
+            System.Diagnostics.Debug.WriteLine($"Failed to send args to running instance: {ex.Message}");
+        }
     }
 
     private static bool IsAdmin()

@@ -82,6 +82,7 @@ namespace Wabbajack.Compiler
             AbsolutePath collectionJsonPath,
             AbsolutePath archivePath,
             int? existingCollectionId = null,
+            string? gameVersion = null,
             CancellationToken token = default)
         {
             try
@@ -119,7 +120,7 @@ namespace Wabbajack.Compiler
 
                 _logger.LogInformation("File uploaded successfully");
 
-                var collectionPayload = WabbajackToVortexCollection.Build(modList);
+                var collectionPayload = WabbajackToVortexCollection.Build(modList, gameVersion);
 
                 _logger.LogInformation("Creating/updating collection on Nexus Mods (existingCollectionId={id})",
                     existingCollectionId.HasValue ? existingCollectionId.Value : 0);
@@ -495,11 +496,12 @@ mutation createOrUpdateRevision($collectionData: CollectionPayload!, $uuid: Stri
             };
 
             // Log what we're sending
-            _logger.LogInformation("Manifest info being sent - author: '{author}', name: '{name}', summary: '{summary}', description length: {descLen}",
+            _logger.LogInformation("Manifest info being sent - author: '{author}', name: '{name}', summary: '{summary}', description length: {descLen}, gameVersions: {gameVersions}",
                 manifestInfo.author,
                 manifestInfo.name,
                 manifestInfo.summary,
-                manifestInfo.description?.Length ?? 0);
+                manifestInfo.description?.Length ?? 0,
+                manifestInfo.gameVersions != null ? string.Join(", ", manifestInfo.gameVersions) : "null");
 
             const int MinCollectionNameLength = 3;
             const int MaxCollectionNameLength = 36;
@@ -600,12 +602,15 @@ mutation createOrUpdateRevision($collectionData: CollectionPayload!, $uuid: Stri
                     variables
                 };
 
+                var serializedRequest = JsonSerializer.Serialize(graphqlRequest, new JsonSerializerOptions
+                {
+                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                });
+
+
                 using var content = new StringContent(
-                    JsonSerializer.Serialize(graphqlRequest, new JsonSerializerOptions
-                    {
-                        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-                    }),
+                    serializedRequest,
                     Encoding.UTF8,
                     "application/json");
 
