@@ -1,40 +1,42 @@
-﻿using Microsoft.Extensions.Logging;
-using Wabbajack.Messages;
+﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using ReactiveUI;
-using System.Reactive.Disposables;
 using ReactiveUI.Fody.Helpers;
-using Wabbajack.DTOs.JsonConverters;
-using Wabbajack.Models;
-using Wabbajack.Networking.WabbajackClientApi;
-using Wabbajack.Services.OSIntegrated;
-using System.Windows.Input;
 using System;
-using System.Diagnostics;
-using System.Threading.Tasks;
-using System.Threading;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Compression;
 using System.Linq;
+using System.Net.Http;
 using System.Reactive;
+using System.Reactive.Concurrency;
+using System.Reactive.Disposables;
 using System.Reactive.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Input;
 using Wabbajack.Common;
 using Wabbajack.Compiler;
+using Wabbajack.Downloaders;
+using Wabbajack.Downloaders.GameFile;
 using Wabbajack.DTOs;
+using Wabbajack.DTOs.DownloadStates;
+using Wabbajack.DTOs.JsonConverters;
+using Wabbajack.DTOs.Logins;
 using Wabbajack.Extensions;
 using Wabbajack.Installer;
+using Wabbajack.LoginManagers;
+using Wabbajack.Messages;
+using Wabbajack.Models;
+using Wabbajack.Networking.Http.Interfaces;
+using Wabbajack.Networking.WabbajackClientApi;
 using Wabbajack.Paths;
 using Wabbajack.Paths.IO;
 using Wabbajack.RateLimiter;
-using Wabbajack.LoginManagers;
-using Wabbajack.Downloaders;
-using Wabbajack.DTOs.DownloadStates;
-using System.Reactive.Concurrency;
+using Wabbajack.Services.OSIntegrated;
 using FileMode = System.IO.FileMode;
-using Wabbajack.Networking.Http.Interfaces;
-using Wabbajack.DTOs.Logins;
-using System.Net.Http;
-using System.IO;
-using System.IO.Compression;
 
 namespace Wabbajack;
 
@@ -395,7 +397,28 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
                 modList = _dtos.Deserialize<ModList>(modListJson)!;
             }
 
-            var vortexJson = WabbajackToVortexCollection.Serialize(modList);
+            // Get the game version if the game is installed
+            string? gameVersion = null;
+            try
+            {
+                var gameLocator = _serviceProvider.GetRequiredService<IGameLocator>();
+                if (gameLocator.TryFindLocation(modList.GameType, out var gamePath))
+                {
+                    var mainFile = modList.GameType.MetaData().MainExecutable!.Value.RelativeTo(gamePath);
+                    if (mainFile.FileExists())
+                    {
+                        var versionInfo = System.Diagnostics.FileVersionInfo.GetVersionInfo(mainFile.ToString());
+                        gameVersion = versionInfo.FileVersion;
+                        _logger.LogInformation("Detected game version: {version} for {game}", gameVersion, modList.GameType);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not detect game version, collection will be created without game version requirement");
+            }
+
+            var vortexJson = WabbajackToVortexCollection.Serialize(modList, gameVersion);
             var collectionJsonPath = Settings.OutputFile.WithExtension(new Extension(".collection.json"));
             await collectionJsonPath.WriteAllTextAsync(vortexJson);
 

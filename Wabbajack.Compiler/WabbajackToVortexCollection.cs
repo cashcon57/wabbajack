@@ -10,9 +10,9 @@ namespace Wabbajack.Compiler
 {
     public static class WabbajackToVortexCollection
     {
-        public static string Serialize(ModList modList)
+        public static string Serialize(ModList modList, string? gameVersion = null)
         {
-            var obj = Build(modList);
+            var obj = Build(modList, gameVersion);
 
             var opts = new JsonSerializerOptions
             {
@@ -24,7 +24,7 @@ namespace Wabbajack.Compiler
             return JsonSerializer.Serialize(obj, opts);
         }
 
-        public static VortexCollection Build(ModList modList)
+        public static VortexCollection Build(ModList modList, string? gameVersion = null)
         {
             var listDomain = GetDomain(modList.GameType.ToString());
 
@@ -75,6 +75,10 @@ namespace Wabbajack.Compiler
                 description = "A Wabbajack modlist for " + modList.GameType;
             }
 
+            var gameVersions = !string.IsNullOrWhiteSpace(gameVersion)
+                ? new List<string> { gameVersion }
+                : new List<string>();
+
             return new VortexCollection
             {
                 Info = new VortexInfo
@@ -86,7 +90,7 @@ namespace Wabbajack.Compiler
                     Description = description,
                     InstallInstructions = "This collection was created by Wabbajack. Download and install using Wabbajack from: https://www.wabbajack.org/",
                     DomainName = listDomain,
-                    GameVersions = new List<string>(),
+                    GameVersions = gameVersions,
                 },
                 Mods = mods,
                 CollectionConfig = new Dictionary<string, object>(),

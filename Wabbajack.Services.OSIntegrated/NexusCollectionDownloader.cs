@@ -1,5 +1,6 @@
 ﻿using Microsoft.Extensions.Logging;
 using System;
+using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -7,6 +8,8 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
+using Wabbajack.Downloaders.GameFile;
+using Wabbajack.DTOs;
 using Wabbajack.DTOs.Logins;
 using Wabbajack.Networking.Http.Interfaces;
 
@@ -17,12 +20,13 @@ namespace Wabbajack.Services.OSIntegrated
         private readonly ILogger<NexusCollectionDownloader> _logger;
         private readonly ITokenProvider<NexusOAuthState> _tokenProvider;
         private readonly HttpClient _httpClient;
+        private readonly GameLocator _gameLocator;
 
         private static readonly string GraphQLUrl =
             Environment.GetEnvironmentVariable("NEXUS_GRAPHQL_URL")
             ?? "https://api.nexusmods.com/v2/graphql";
 
-        // GraphQL query to get collection revision info with download link
+        // GraphQL query to get collection revision info with download link and game info
         private const string CollectionRevisionQuery = @"
             query collectionRevision($slug: String!, $revision: Int) {
                 collectionRevision(slug: $slug, revision: $revision) {
@@ -34,18 +38,27 @@ namespace Wabbajack.Services.OSIntegrated
                         id
                         slug
                         name
+                        game {
+                            id
+                            name
+                            domainName
+                        }
                     }
                 }
             }";
 
+        public string? LastError { get; private set; }
+
         public NexusCollectionDownloader(
             ILogger<NexusCollectionDownloader> logger,
             ITokenProvider<NexusOAuthState> tokenProvider,
-            HttpClient httpClient)
+            HttpClient httpClient,
+            GameLocator gameLocator)
         {
             _logger = logger;
             _tokenProvider = tokenProvider;
             _httpClient = httpClient;
+            _gameLocator = gameLocator;
         }
 
         public async Task<CollectionDownloadInfo?> GetCollectionDownloadInfo(
@@ -53,12 +66,15 @@ namespace Wabbajack.Services.OSIntegrated
             int? revisionNumber,
             CancellationToken token = default)
         {
+            LastError = null;
+
             try
             {
                 // Get OAuth token
                 if (!_tokenProvider.HaveToken())
                 {
                     _logger.LogError("No Nexus Mods OAuth token available for downloading collection");
+                    LastError = "You are not logged in to Nexus Mods. Please log in to Nexus Mods in Wabbajack Settings to download collections.";
                     return null;
                 }
 
@@ -66,6 +82,7 @@ namespace Wabbajack.Services.OSIntegrated
                 if (authState?.OAuth?.IsExpired ?? true)
                 {
                     _logger.LogError("Nexus Mods OAuth token is expired");
+                    LastError = "Your Nexus Mods login has expired. Please log in to Nexus Mods in Wabbajack Settings to refresh your authentication.";
                     return null;
                 }
 
@@ -136,13 +153,47 @@ namespace Wabbajack.Services.OSIntegrated
                     return null;
                 }
 
-                var collectionName = revisionData["collection"]?["name"]?.GetValue<string>() ?? collectionSlug;
+                var collectionData = revisionData["collection"] as JsonObject;
+                var collectionName = collectionData?["name"]?.GetValue<string>() ?? collectionSlug;
                 var actualRevisionNumber = revisionData["revisionNumber"]?.GetValue<int>() ?? 1;
                 var collectionId = revisionData["collectionId"]?.GetValue<int>() ?? 0;
                 var revisionId = revisionData["id"]?.GetValue<int>() ?? 0;
 
-                _logger.LogInformation("Found collection: {name} (revision {revision})",
-                    collectionName, actualRevisionNumber);
+                // Get game information
+                var gameData = collectionData?["game"] as JsonObject;
+                var gameDomainName = gameData?["domainName"]?.GetValue<string>();
+                var gameDisplayName = gameData?["name"]?.GetValue<string>();
+
+                _logger.LogInformation("Found collection: {name} (revision {revision}) for game: {game}",
+                    collectionName, actualRevisionNumber, gameDisplayName ?? gameDomainName ?? "Unknown");
+
+                // Check if the game is installed
+                Game? requiredGame = null;
+                string? gameName = null;
+
+                if (!string.IsNullOrWhiteSpace(gameDomainName))
+                {
+                    var gameMetadata = GameRegistry.GetByNexusName(gameDomainName);
+                    if (gameMetadata != null)
+                    {
+                        requiredGame = gameMetadata.Game;
+                        gameName = gameMetadata.HumanFriendlyGameName;
+
+                        if (!_gameLocator.IsInstalled(requiredGame.Value))
+                        {
+                            _logger.LogWarning("Cannot download collection '{name}': Required game '{game}' is not installed",
+                                collectionName, gameName);
+                            LastError = $"Cannot install '{collectionName}': {gameName} is not installed on this PC. Please install {gameName} first.";
+                            return null;
+                        }
+
+                        _logger.LogInformation("Game check passed: {game} is installed", gameName);
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Could not map Nexus game '{nexusGame}' to Wabbajack game enum", gameDomainName);
+                    }
+                }
 
                 var downloadLinkUrl = downloadLink.StartsWith("http", StringComparison.OrdinalIgnoreCase)
                     ? downloadLink
@@ -196,7 +247,10 @@ namespace Wabbajack.Services.OSIntegrated
                     RevisionNumber = actualRevisionNumber,
                     RevisionId = revisionId,
                     DownloadUrl = actualDownloadUrl,
-                    DownloadLink = downloadLink
+                    DownloadLink = downloadLink,
+                    GameDomainName = gameDomainName,
+                    GameDisplayName = gameDisplayName,
+                    RequiredGame = requiredGame
                 };
             }
             catch (Exception ex)
@@ -216,5 +270,8 @@ namespace Wabbajack.Services.OSIntegrated
         public int RevisionId { get; set; }
         public string DownloadUrl { get; set; } = "";
         public string DownloadLink { get; set; } = "";
+        public string? GameDomainName { get; set; }
+        public string? GameDisplayName { get; set; }
+        public Game? RequiredGame { get; set; }
     }
 }

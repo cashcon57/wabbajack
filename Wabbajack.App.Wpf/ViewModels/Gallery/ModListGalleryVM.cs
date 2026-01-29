@@ -27,6 +27,7 @@ using Wabbajack.Networking.WabbajackClientApi;
 using Wabbajack.Paths.IO;
 using Wabbajack.Services.OSIntegrated;
 using Wabbajack.Services.OSIntegrated.Services;
+using System.Windows;
 
 namespace Wabbajack;
 public class ModListGalleryVM : BackNavigatingVM, ICanLoadLocalFileVM
@@ -409,6 +410,29 @@ public class ModListGalleryVM : BackNavigatingVM, ICanLoadLocalFileVM
             _logger.LogInformation("[Protocol] Found modlist '{title}' ({namespaced}), executing InstallCommand",
                 modlist.Metadata.Title, modlist.Metadata.NamespacedName);
 
+            // Check if the required game is installed
+            if (!_locator.IsInstalled(modlist.Metadata.Game))
+            {
+                var gameName = modlist.Metadata.Game.MetaData().HumanFriendlyGameName;
+                _logger.LogWarning("[Protocol] Cannot install modlist '{title}': Required game '{game}' is not installed",
+                    modlist.Metadata.Title, gameName);
+
+                var errorMessage = $"Cannot install '{modlist.Metadata.Title}': {gameName} is not installed on this PC. Please install {gameName} first.";
+                Error = ValidationResult.Fail(errorMessage);
+
+                // Show popup error
+                MessageBox.Show(
+                    errorMessage,
+                    "Game Not Installed",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+
+                IsResolvingProtocol = false;
+                ProtocolStatusText = string.Empty;
+                ll.Fail();
+                return;
+            }
+
             if (!modlist.InstallCommand.CanExecute(null))
             {
                 _logger.LogWarning("[Protocol] Cannot install modlist: {name}", modlist.Metadata.Title);
@@ -594,8 +618,20 @@ public class ModListGalleryVM : BackNavigatingVM, ICanLoadLocalFileVM
 
             if (collectionInfo == null)
             {
+                var errorMessage = !string.IsNullOrWhiteSpace(nexusDownloader.LastError)
+                    ? nexusDownloader.LastError
+                    : $"Failed to fetch collection '{slug}' from Nexus Mods.";
+
                 _logger.LogError("[Protocol] Failed to get collection info from Nexus");
-                Error = ValidationResult.Fail($"Failed to fetch collection '{slug}' from Nexus Mods. You may need to log in to Nexus.");
+                Error = ValidationResult.Fail(errorMessage);
+
+                // Show popup error
+                MessageBox.Show(
+                    errorMessage,
+                    "Nexus Collection Download Failed",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+
                 IsResolvingProtocol = false;
                 ProtocolStatusText = string.Empty;
                 return;
