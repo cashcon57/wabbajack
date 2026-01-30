@@ -181,14 +181,18 @@ public partial class CompilerMainView : ReactiveUserControl<CompilerMainVM>
                 .DisposeWith(disposables);
 
             ViewModel.WhenAnyValue(vm => vm.IsPublishingCollection,
-                                    vm => vm.PublishCollectionLastResult,
-                                    vm => vm.PreflightChecksPassed)
+                        vm => vm.PublishCollectionLastResult,
+                        vm => vm.PreflightChecksPassed,
+                        vm => vm.ExistingCollectionRevisionNumber,
+                        vm => vm.IsCheckingCollectionStatus)
                 .ObserveOnGuiThread()
                 .Subscribe(x =>
                 {
                     var isBusy = x.Item1;
                     var result = x.Item2;
                     var preflightPassed = x.Item3;
+                    var existingRevision = x.Item4;
+                    var isChecking = x.Item5;
 
                     if (isBusy) _ClickedPublishCollection = true;
 
@@ -203,18 +207,33 @@ public partial class CompilerMainView : ReactiveUserControl<CompilerMainVM>
 
                     if (isBusy)
                     {
-                        PublishCollectionButton.Text = "Creating collection...";
+                        PublishCollectionButton.Text = existingRevision.HasValue
+                            ? $"Pushing revision {existingRevision.Value + 1}..."
+                            : "Creating collection...";
+                        return;
+                    }
+
+                    if (isChecking)
+                    {
+                        PublishCollectionButton.Text = "Checking collection status...";
                         return;
                     }
 
                     if (!_ClickedPublishCollection)
                     {
-                        PublishCollectionButton.Text = "Publish Nexus Mods Collection (experimental)";
+                        if (existingRevision.HasValue)
+                        {
+                            PublishCollectionButton.Text = $"Push Revision {existingRevision.Value + 1} to Nexus Collection";
+                        }
+                        else
+                        {
+                            PublishCollectionButton.Text = "Create New Nexus Mods Collection";
+                        }
                         return;
                     }
 
                     PublishCollectionButton.Text = result == CompilerMainVM.PublishCollectionResult.Success
-                        ? "Collection Completed"
+                        ? (existingRevision.HasValue ? "Revision Pushed Successfully" : "Collection Created Successfully")
                         : "Collection Failed";
                 })
                 .DisposeWith(disposables);

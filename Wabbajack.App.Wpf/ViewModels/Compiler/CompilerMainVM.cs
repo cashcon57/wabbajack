@@ -55,8 +55,6 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
 
     public LogStream LoggerProvider { get; }
     public CancellationTokenSource CancellationTokenSource { get; private set; }
-
-    private const bool SKIP_VALIDATION_FOR_TESTING = false;
     public ICommand GetHelpCommand { get; }
     public ICommand StartCommand { get; }
     public ICommand CancelCommand { get; }
@@ -75,6 +73,10 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
 
     [Reactive] public bool? PreflightChecksPassed { get; set; } = null;
     [Reactive] public string PreflightCheckMessage { get; set; } = "";
+
+    [Reactive] public int? ExistingCollectionRevisionNumber { get; set; }
+    [Reactive] public string? ExistingCollectionSlug { get; set; }
+    [Reactive] public bool IsCheckingCollectionStatus { get; set; }
 
     public bool IsBusy => IsPublishing || IsPublishingCollection;
 
@@ -200,7 +202,11 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
                 .DisposeWith(disposables);
             this.WhenAnyValue(x => x.State)
                 .Where(s => s == CompilerState.Completed)
-                .Subscribe(async _ => await RunPreflightChecksAsync())
+                .Subscribe(async _ =>
+                {
+                    await RunPreflightChecksAsync();
+                    await CheckExistingCollectionStatus();
+                })
                 .DisposeWith(disposables);
 
         });
@@ -436,26 +442,19 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
             string? existingSlug = null;
             string? existingDomain = null;
 
-            if (!SKIP_VALIDATION_FOR_TESTING)
+            try
             {
-                try
+                var mapping = await _wjClient.GetNexusCollectionMapping(Settings.MachineUrl, CancellationToken.None);
+                if (mapping != null && mapping.CollectionId > 0)
                 {
-                    var mapping = await _wjClient.GetNexusCollectionMapping(Settings.MachineUrl, CancellationToken.None);
-                    if (mapping != null && mapping.CollectionId > 0)
-                    {
-                        existingCollectionId = mapping.CollectionId;
-                        existingSlug = mapping.Slug;
-                        existingDomain = mapping.DomainName;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to read Nexus collection mapping from modlists.json; will create a new collection instead.");
+                    existingCollectionId = mapping.CollectionId;
+                    existingSlug = mapping.Slug;
+                    existingDomain = mapping.DomainName;
                 }
             }
-            else
+            catch (Exception ex)
             {
-                _logger.LogWarning("SKIP_VALIDATION_FOR_TESTING is enabled - skipping modlists.json mapping lookup");
+                _logger.LogWarning(ex, "Failed to read Nexus collection mapping from modlists.json; will create a new collection instead.");
             }
 
             if (existingCollectionId.HasValue &&
@@ -536,6 +535,122 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
         }
     }
 
+    private async Task CheckExistingCollectionStatus()
+    {
+        try
+        {
+            IsCheckingCollectionStatus = true;
+            ExistingCollectionRevisionNumber = null;
+            ExistingCollectionSlug = null;
+
+            // Get mapping from modlists.json
+            var mapping = await _wjClient.GetNexusCollectionMapping(Settings.MachineUrl, CancellationToken.None);
+            if (mapping == null || mapping.CollectionId <= 0 || string.IsNullOrWhiteSpace(mapping.Slug))
+            {
+                _logger.LogInformation("No existing Nexus collection mapping found");
+                return;
+            }
+
+            ExistingCollectionSlug = mapping.Slug;
+
+            // Use the Game from Settings to get the domain
+            var listDomain = WabbajackToVortexCollection.GetDomain(Settings.Game.ToString());
+
+            // Now query Nexus GraphQL to get the latest revision number
+            var latestRevision = await GetLatestCollectionRevision(
+                mapping.Slug,
+                mapping.DomainName ?? listDomain,
+                CancellationToken.None);
+
+            if (latestRevision.HasValue)
+            {
+                ExistingCollectionRevisionNumber = latestRevision.Value;
+                _logger.LogInformation("Found existing collection '{slug}' at revision {rev}",
+                    mapping.Slug, latestRevision.Value);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to check existing collection status");
+            ExistingCollectionRevisionNumber = null;
+            ExistingCollectionSlug = null;
+        }
+        finally
+        {
+            IsCheckingCollectionStatus = false;
+        }
+    }
+
+    private async Task<int?> GetLatestCollectionRevision(string slug, string domainName, CancellationToken token)
+    {
+        if (!_nexusTokenProvider.HaveToken())
+            return null;
+
+        var authState = await _nexusTokenProvider.Get();
+        if (authState?.OAuth?.IsExpired ?? true)
+            return null;
+
+        var query = @"
+            query collectionRevision($slug: String!, $domainName: String!) {
+              collectionRevision(slug: $slug, domainName: $domainName) {
+                revisionNumber
+              }
+            }";
+
+        var variables = new
+        {
+            slug,
+            domainName
+        };
+
+        var graphqlRequest = new
+        {
+            query,
+            variables
+        };
+
+        using var content = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(graphqlRequest, new System.Text.Json.JsonSerializerOptions
+            {
+                PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase,
+                DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+            }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.nexusmods.com/v2/graphql")
+        {
+            Content = content
+        };
+
+        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", authState.OAuth.AccessToken);
+        request.Headers.TryAddWithoutValidation("Application-Name", "Wabbajack");
+        request.Headers.TryAddWithoutValidation("Application-Version", "0.0.0");
+        request.Headers.TryAddWithoutValidation("Protocol-Version", "1.5.0");
+
+        try
+        {
+            var response = await _httpClient.SendAsync(request, token);
+            var responseBody = await response.Content.ReadAsStringAsync(token);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Failed to fetch collection revision: {status}", response.StatusCode);
+                return null;
+            }
+
+            var root = System.Text.Json.Nodes.JsonNode.Parse(responseBody) as System.Text.Json.Nodes.JsonObject;
+            var revisionNumber = root?["data"]?["collectionRevision"]?["revisionNumber"]?.GetValue<int>();
+
+            return revisionNumber;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error fetching collection revision from Nexus");
+            return null;
+        }
+    }
+
     private async Task EnsureLoggedIntoNexus()
     {
         var nexusDownloadState = new Nexus();
@@ -585,11 +700,6 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
     private async Task<bool> RunPreflightChecks(CancellationToken token)
     {
 
-        if (SKIP_VALIDATION_FOR_TESTING)
-        {
-            _logger.LogWarning("SKIP_VALIDATION_FOR_TESTING is enabled - bypassing preflight checks");
-            return true;
-        }
         IReadOnlyList<string> lists;
         try
         {
