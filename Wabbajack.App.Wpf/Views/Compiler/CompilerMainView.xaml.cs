@@ -176,25 +176,35 @@ public partial class CompilerMainView : ReactiveUserControl<CompilerMainVM>
                 .DisposeWith(disposables);
 
 
+
+
             PublishCollectionButton.Events().Click
                 .Subscribe(async _ => await HandlePublishCollectionClick())
                 .DisposeWith(disposables);
 
-            ViewModel.WhenAnyValue(vm => vm.IsPublishingCollection,
-                        vm => vm.PublishCollectionLastResult,
-                        vm => vm.PreflightChecksPassed,
-                        vm => vm.ExistingCollectionRevisionNumber,
-                        vm => vm.IsCheckingCollectionStatus)
+            ViewModel.WhenAnyValue(
+                    vm => vm.CollectionPublishingPercentage,
+                    vm => vm.CollectionPublishingStage,
+                    vm => vm.IsPublishingCollection,
+                    vm => vm.PublishCollectionLastResult,
+                    vm => vm.PreflightChecksPassed,
+                    vm => vm.ExistingCollectionRevisionNumber,
+                    vm => vm.IsCheckingCollectionStatus)
                 .ObserveOnGuiThread()
                 .Subscribe(x =>
                 {
-                    var isBusy = x.Item1;
-                    var result = x.Item2;
-                    var preflightPassed = x.Item3;
-                    var existingRevision = x.Item4;
-                    var isChecking = x.Item5;
+                    var percentage = x.Item1;
+                    var stage = x.Item2;
+                    var isBusy = x.Item3;
+                    var result = x.Item4;
+                    var preflightPassed = x.Item5;
+                    var existingRevision = x.Item6;
+                    var isChecking = x.Item7;
 
                     if (isBusy) _ClickedPublishCollection = true;
+
+                    // Update progress bar
+                    PublishCollectionButton.ProgressPercentage = percentage;
 
                     if (preflightPassed == false)
                     {
@@ -203,13 +213,17 @@ public partial class CompilerMainView : ReactiveUserControl<CompilerMainVM>
                         return;
                     }
 
-                    PublishCollectionButton.IsEnabled = ViewModel.PublishCollectionCommand.CanExecute(null);
+                    // Update enabled state based on all conditions
+                    var canExecute = !isBusy &&
+                                    !ViewModel.IsPublishing &&
+                                    ViewModel.State == CompilerState.Completed &&
+                                    preflightPassed == true;
+
+                    PublishCollectionButton.IsEnabled = canExecute;
 
                     if (isBusy)
                     {
-                        PublishCollectionButton.Text = existingRevision.HasValue
-                            ? $"Pushing revision {existingRevision.Value + 1}..."
-                            : "Creating collection...";
+                        PublishCollectionButton.Text = stage;
                         return;
                     }
 
@@ -223,11 +237,11 @@ public partial class CompilerMainView : ReactiveUserControl<CompilerMainVM>
                     {
                         if (existingRevision.HasValue)
                         {
-                            PublishCollectionButton.Text = $"Push Revision {existingRevision.Value + 1} to Nexus Collection";
+                            PublishCollectionButton.Text = $"Push Revision {existingRevision.Value + 1} to Nexus Mods";
                         }
                         else
                         {
-                            PublishCollectionButton.Text = "Create New Nexus Mods Collection";
+                            PublishCollectionButton.Text = "Create Nexus Mods Collection page";
                         }
                         return;
                     }

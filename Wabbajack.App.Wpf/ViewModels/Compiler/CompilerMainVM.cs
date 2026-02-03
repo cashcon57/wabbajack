@@ -78,6 +78,9 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
     [Reactive] public string? ExistingCollectionSlug { get; set; }
     [Reactive] public bool IsCheckingCollectionStatus { get; set; }
 
+    [Reactive] public Percent CollectionPublishingPercentage { get; set; } = Percent.One;
+    [Reactive] public string CollectionPublishingStage { get; set; } = "";
+
     public bool IsBusy => IsPublishing || IsPublishingCollection;
 
     public bool Cancelling { get; private set; }
@@ -179,6 +182,10 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
                 CurrentStep = Step.Configuration;
                 State = CompilerState.Configuration;
                 ProgressState = ProgressState.Normal;
+                // Reset collection publishing state when entering configuration
+                CollectionPublishingPercentage = Percent.One;
+                CollectionPublishingStage = "";
+                PublishCollectionLastResult = PublishCollectionResult.None;
             }
 
             this.WhenAnyValue(x => x.CompilerDetailsVM.Settings)
@@ -206,6 +213,10 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
                 {
                     await RunPreflightChecksAsync();
                     await CheckExistingCollectionStatus();
+                    // Reset collection publishing state when compilation completes
+                    CollectionPublishingPercentage = Percent.One;
+                    CollectionPublishingStage = "";
+                    PublishCollectionLastResult = PublishCollectionResult.None;
                 })
                 .DisposeWith(disposables);
 
@@ -317,6 +328,12 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
                     State = CompilerState.Completed;
                     CurrentStep = Step.Done;
                     ProgressState = ProgressState.Success;
+
+                    // Reset collection publishing state for fresh start
+                    CollectionPublishingPercentage = Percent.One;
+                    CollectionPublishingStage = "";
+                    PublishCollectionLastResult = PublishCollectionResult.None;
+
                     return Disposable.Empty;
                 });
             }
@@ -328,10 +345,16 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
                     if (Cancelling)
                     {
                         this.ProgressText = "Compilation Cancelled";
-                        ProgressPercent = Percent.Zero;
+                        ProgressPercent = Percent.One;
                         State = CompilerState.Configuration;
                         _logger.LogInformation(ex, "Cancelled compilation: {Message}", ex.Message);
                         Cancelling = false;
+
+                        // Reset collection publishing state
+                        CollectionPublishingPercentage = Percent.One;
+                        CollectionPublishingStage = "";
+                        PublishCollectionLastResult = PublishCollectionResult.None;
+
                         return Disposable.Empty;
                     }
                     else
@@ -341,6 +364,12 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
 
                         State = CompilerState.Errored;
                         _logger.LogError(ex, "Failed compilation: {Message}", ex.Message);
+
+                        // Reset collection publishing state
+                        CollectionPublishingPercentage = Percent.One;
+                        CollectionPublishingStage = "";
+                        PublishCollectionLastResult = PublishCollectionResult.None;
+
                         return Disposable.Empty;
                     }
                 });
@@ -380,9 +409,11 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
     {
         try
         {
-            BusyStatusText = "Creating Nexus Mods collection page...";
+            BusyStatusText = "Preparing collection upload...";
             PublishCollectionLastResult = PublishCollectionResult.None;
             IsPublishingCollection = true;
+            CollectionPublishingPercentage = Percent.One;
+            CollectionPublishingStage = "Reading modlist...";
 
             ModList modList;
 
@@ -403,10 +434,13 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
                 modList = _dtos.Deserialize<ModList>(modListJson)!;
             }
 
+            CollectionPublishingPercentage = new Percent(0.05);
+
             // Get the game version if the game is installed
             string? gameVersion = null;
             try
             {
+                CollectionPublishingStage = "Detecting game version...";
                 var gameLocator = _serviceProvider.GetRequiredService<IGameLocator>();
                 if (gameLocator.TryFindLocation(modList.GameType, out var gamePath))
                 {
@@ -424,8 +458,17 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
                 _logger.LogWarning(ex, "Could not detect game version, collection will be created without game version requirement");
             }
 
+            CollectionPublishingPercentage = new Percent(0.1);
+            CollectionPublishingStage = "Converting to collection format...";
+            _logger.LogInformation(
+                "Building Vortex collection from {count} archives...",
+                modList.Archives?.Count() ?? 0);
+
             var vortexJson = WabbajackToVortexCollection.Serialize(modList, gameVersion);
+
+            _logger.LogInformation("Vortex collection built successfully");
             var collectionJsonPath = Settings.OutputFile.WithExtension(new Extension(".collection.json"));
+
             await collectionJsonPath.WriteAllTextAsync(vortexJson);
 
             var uploader = new NexusCollectionUploader(
@@ -434,6 +477,47 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
                 _httpClient,
                 _dtos.Options
             );
+
+            // Subscribe to progress events
+            uploader.OnProgress += (stage, progress) =>
+            {
+                RxApp.MainThreadScheduler.Schedule(() =>
+                {
+                    switch (stage)
+                    {
+                        case "requesting_url":
+                            CollectionPublishingStage = "Requesting upload URL...";
+                            CollectionPublishingPercentage = new Percent(0.15);
+                            break;
+                        case "upload":
+                            // Map upload progress from 0.15 to 0.85 (70% of total)
+                            var uploadPercent = 0.15 + (progress * 0.70);
+                            CollectionPublishingStage = $"Uploading file ({progress:P0})...";
+                            CollectionPublishingPercentage = new Percent(uploadPercent);
+                            BusyStatusText = $"Uploading to Nexus Mods ({progress:P0})...";
+                            break;
+                        case "building_manifest":
+                            CollectionPublishingStage = "Building manifest...";
+                            CollectionPublishingPercentage = new Percent(0.86);
+                            BusyStatusText = "Building collection manifest...";
+                            break;
+                        case "sending_manifest":
+                            CollectionPublishingStage = "Sending to Nexus Mods...";
+                            CollectionPublishingPercentage = new Percent(0.90);
+                            BusyStatusText = "Sending manifest to Nexus Mods (this may take several minutes)...";
+                            break;
+                        case "finalizing":
+                            CollectionPublishingStage = "Finalizing...";
+                            CollectionPublishingPercentage = new Percent(0.95);
+                            BusyStatusText = "Finalizing collection...";
+                            break;
+                        case "complete":
+                            CollectionPublishingStage = "Complete!";
+                            CollectionPublishingPercentage = Percent.One;
+                            break;
+                    }
+                });
+            };
 
             var listDomain = WabbajackToVortexCollection.GetDomain(modList.GameType.ToString());
 
@@ -531,6 +615,7 @@ public class CompilerMainVM : BaseCompilerVM, ICanGetHelpVM, ICpuStatusVM
         finally
         {
             IsPublishingCollection = false;
+            CollectionPublishingPercentage = Percent.One;
             BusyStatusText = "";
         }
     }

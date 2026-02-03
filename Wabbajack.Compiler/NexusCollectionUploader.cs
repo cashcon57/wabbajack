@@ -28,18 +28,15 @@ namespace Wabbajack.Compiler
         {
             public string type { get; set; } = "nexus";
 
-            // nexus
+            // nexus-type fields only
             public long modId { get; set; }
             public long fileId { get; set; }
 
-            // off-site
+            // off-site/browse-type fields
             public string? url { get; set; }
-            public string? instructions { get; set; }
-            public string? md5 { get; set; }
-            public long? fileSize { get; set; }
 
+            // Common field
             public string? updatePolicy { get; set; }
-            public string? logicalFilename { get; set; }
         }
 
         private sealed class ManifestMod
@@ -48,7 +45,6 @@ namespace Wabbajack.Compiler
             public string version { get; set; } = "1.0.0";
             public bool optional { get; set; }
             public string domainName { get; set; } = "";
-            public string? author { get; set; }
             public ManifestModSource source { get; set; } = new();
         }
 
@@ -56,13 +52,14 @@ namespace Wabbajack.Compiler
         private readonly ITokenProvider<NexusOAuthState> _tokenProvider;
         private readonly HttpClient _httpClient;
         private readonly JsonSerializerOptions _jsonOptions;
+        public delegate void UploadProgressHandler(string stage, double progress);
+        public event UploadProgressHandler? OnProgress;
 
         // via nexusmods/nexus-api talks to https://api.nexusmods.com/v2/graphql
         private static readonly string GraphQLUrl =
             Environment.GetEnvironmentVariable("NEXUS_GRAPHQL_URL")
             ?? "https://api.nexusmods.com/v2/graphql";
 
-        // same as Vortex
         private const int CollectionSchemaId = 2;
 
         public NexusCollectionUploader(
@@ -78,12 +75,12 @@ namespace Wabbajack.Compiler
         }
 
         public async Task<CollectionUploadResult?> UploadCollection(
-            ModList modList,
-            AbsolutePath collectionJsonPath,
-            AbsolutePath archivePath,
-            int? existingCollectionId = null,
-            string? gameVersion = null,
-            CancellationToken token = default)
+    ModList modList,
+    AbsolutePath collectionJsonPath,
+    AbsolutePath archivePath,
+    int? existingCollectionId = null,
+    string? gameVersion = null,
+    CancellationToken token = default)
         {
             try
             {
@@ -100,6 +97,7 @@ namespace Wabbajack.Compiler
                     return null;
                 }
 
+                OnProgress?.Invoke("requesting_url", 0.0);
                 _logger.LogInformation("Requesting upload URL from Nexus Mods...");
                 var uploadUrlResult = await GetRevisionUploadUrl(authState.OAuth.AccessToken, token);
                 if (uploadUrlResult == null)
@@ -110,6 +108,7 @@ namespace Wabbajack.Compiler
 
                 _logger.LogInformation("Got upload URL with UUID: {uuid}", uploadUrlResult.Uuid);
 
+                OnProgress?.Invoke("upload", 0.0);
                 _logger.LogInformation("Uploading collection archive ({size:N0} bytes)...", archivePath.Size());
                 var uploadSuccess = await UploadFileToPresignedUrl(uploadUrlResult.Url, archivePath, token);
                 if (!uploadSuccess)
@@ -120,8 +119,10 @@ namespace Wabbajack.Compiler
 
                 _logger.LogInformation("File uploaded successfully");
 
+                OnProgress?.Invoke("building_manifest", 0.0);
                 var collectionPayload = WabbajackToVortexCollection.Build(modList, gameVersion);
 
+                OnProgress?.Invoke("sending_manifest", 0.0);
                 _logger.LogInformation("Creating/updating collection on Nexus Mods (existingCollectionId={id})",
                     existingCollectionId.HasValue ? existingCollectionId.Value : 0);
 
@@ -135,6 +136,7 @@ namespace Wabbajack.Compiler
                         existingCollectionId.Value,
                         modList.IsNSFW,
                         authState.OAuth.AccessToken,
+                        collectionJsonPath,
                         token);
 
                     if (result == null)
@@ -152,6 +154,7 @@ namespace Wabbajack.Compiler
                         uploadUrlResult.Uuid,
                         modList.IsNSFW,
                         authState.OAuth.AccessToken,
+                        collectionJsonPath,
                         token);
                 }
 
@@ -162,16 +165,17 @@ namespace Wabbajack.Compiler
                         result.Slug,
                         result.RevisionNumber);
 
-
+                    OnProgress?.Invoke("finalizing", 0.0);
                     await UpdateCollectionCategory(result.CollectionId, "wabbajack", authState.OAuth.AccessToken, token);
 
                     // Tag id 25 == wabbajack
                     var tagAdded = await AddCollectionTag(result.CollectionId, 25, authState.OAuth.AccessToken, token);
                     if (!tagAdded)
                     {
-                        // This is expected if the tag was already added
                         _logger.LogInformation("Wabbajack tag already present on collection");
                     }
+
+                    OnProgress?.Invoke("complete", 1.0);
                 }
                 else
                 {
@@ -384,39 +388,101 @@ query collectionRevisionUploadUrl {
             return result?.Data?.CollectionRevisionUploadUrl;
         }
 
-        private async Task<bool> UploadFileToPresignedUrl(string presignedUrl, AbsolutePath filePath, CancellationToken token)
+        private async Task<bool> UploadFileToPresignedUrl(
+            string presignedUrl,
+            AbsolutePath filePath,
+            CancellationToken token)
         {
-            try
+            const int MaxRetries = 3;
+
+            for (int attempt = 1; attempt <= MaxRetries; attempt++)
             {
-                var fileSize = filePath.Size();
-
-                _logger.LogInformation("Uploading to pre-signed URL...");
-                await using var stream = filePath.Open(FileMode.Open, FileAccess.Read, FileShare.Read);
-
-                using var content = new StreamContent(stream);
-                content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-                content.Headers.ContentLength = fileSize;
-
-                using var request = new HttpRequestMessage(HttpMethod.Put, presignedUrl)
+                try
                 {
-                    Content = content
-                };
+                    var fileSize = filePath.Size();
+                    _logger.LogInformation("Uploading to pre-signed URL (attempt {attempt}/{max})...", attempt, MaxRetries);
 
-                var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+                    await using var fileStream = filePath.Open(FileMode.Open, FileAccess.Read, FileShare.Read);
 
-                if (!response.IsSuccessStatusCode)
-                {
-                    var errorBody = await response.Content.ReadAsStringAsync(token);
-                    _logger.LogError("Upload failed: {status} - {body}", response.StatusCode, errorBody);
+                    var progressStream = new ProgressStream(fileStream, fileSize, (bytesRead, totalBytes) =>
+                    {
+                        var percentage = (double)bytesRead / totalBytes;
+                        OnProgress?.Invoke("upload", percentage);
+                    });
+
+                    using var content = new StreamContent(progressStream, 81920); // 80KB buffer size
+                    content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                    content.Headers.ContentLength = fileSize;
+
+                    using var request = new HttpRequestMessage(HttpMethod.Put, presignedUrl)
+                    {
+                        Content = content
+                    };
+
+                    using var uploadClient = new HttpClient
+                    {
+                        Timeout = Timeout.InfiniteTimeSpan
+                    };
+
+                    using var uploadCts = new CancellationTokenSource(TimeSpan.FromMinutes(45));
+                    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, uploadCts.Token);
+
+                    var response = await uploadClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, linkedCts.Token);
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        var errorBody = await response.Content.ReadAsStringAsync(linkedCts.Token);
+                        _logger.LogError("Upload failed: {status} - {body}", response.StatusCode, errorBody);
+
+                        if (attempt < MaxRetries)
+                        {
+                            var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt) * 5); // 10s, 20s, 40s
+                            _logger.LogWarning("Retrying upload in {delay} seconds...", delay.TotalSeconds);
+                            await Task.Delay(delay, token);
+                            continue;
+                        }
+
+                        return false;
+                    }
+
+                    _logger.LogInformation("Upload completed successfully");
+                    return true;
                 }
+                catch (HttpRequestException ex) when (attempt < MaxRetries)
+                {
+                    _logger.LogWarning(ex, "Network error during upload attempt {attempt}/{max}", attempt, MaxRetries);
+                    var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt) * 5);
+                    _logger.LogInformation("Retrying upload in {delay} seconds...", delay.TotalSeconds);
+                    await Task.Delay(delay, token);
+                    continue;
+                }
+                catch (IOException ex) when (attempt < MaxRetries &&
+                    (ex.InnerException is System.Net.Sockets.SocketException socketEx &&
+                     socketEx.SocketErrorCode == System.Net.Sockets.SocketError.ConnectionReset))
+                {
+                    _logger.LogWarning(ex, "Connection reset during upload attempt {attempt}/{max}", attempt, MaxRetries);
+                    var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt) * 5);
+                    _logger.LogInformation("Retrying upload in {delay} seconds...", delay.TotalSeconds);
+                    await Task.Delay(delay, token);
+                    continue;
+                }
+                catch (TaskCanceledException ex) when (attempt < MaxRetries)
+                {
+                    _logger.LogWarning(ex, "Upload timeout on attempt {attempt}/{max}", attempt, MaxRetries);
+                    var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt) * 5);
+                    _logger.LogInformation("Retrying upload in {delay} seconds...", delay.TotalSeconds);
+                    await Task.Delay(delay, token);
+                    continue;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to upload to pre-signed URL");
+                    return false;
+                }
+            }
 
-                return response.IsSuccessStatusCode;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to upload to pre-signed URL");
-                return false;
-            }
+            _logger.LogError("Upload failed after {max} attempts", MaxRetries);
+            return false;
         }
 
         private async Task<CollectionUploadResult?> CreateCollection(
@@ -424,6 +490,7 @@ query collectionRevisionUploadUrl {
             string assetFileUUID,
             bool adultContent,
             string accessToken,
+            AbsolutePath collectionJsonPath,
             CancellationToken token)
         {
             var mutation = @"
@@ -443,6 +510,7 @@ mutation createCollection($collectionData: CollectionPayload!, $uuid: String!) {
                 null,
                 adultContent,
                 accessToken,
+                collectionJsonPath,
                 token);
         }
 
@@ -452,6 +520,7 @@ mutation createCollection($collectionData: CollectionPayload!, $uuid: String!) {
             int collectionId,
             bool adultContent,
             string accessToken,
+            AbsolutePath collectionJsonPath,
             CancellationToken token)
         {
             var mutation = @"
@@ -471,6 +540,7 @@ mutation createOrUpdateRevision($collectionData: CollectionPayload!, $uuid: Stri
                 collectionId,
                 adultContent,
                 accessToken,
+                collectionJsonPath,
                 token);
         }
 
@@ -482,8 +552,10 @@ mutation createOrUpdateRevision($collectionData: CollectionPayload!, $uuid: Stri
             int? collectionId,
             bool adultContent,
             string accessToken,
+            AbsolutePath collectionJsonPath,
             CancellationToken token)
         {
+            // not send installInstructions it's not needed and bloats the payload
             var manifestInfo = new
             {
                 author = string.IsNullOrWhiteSpace(collectionPayload.Info.Author) ? "Anonymous" : collectionPayload.Info.Author,
@@ -535,6 +607,8 @@ mutation createOrUpdateRevision($collectionData: CollectionPayload!, $uuid: Stri
                 return null;
             }
 
+            // Only include the minimal required fields no author, no details, no phase
+            // This reduces payload size significantly for large modlists
             var manifestMods = (collectionPayload.Mods ?? new List<WabbajackToVortexCollection.VortexMod>())
                 .Select(mod => new ManifestMod
                 {
@@ -542,20 +616,15 @@ mutation createOrUpdateRevision($collectionData: CollectionPayload!, $uuid: Stri
                     version = string.IsNullOrWhiteSpace(mod.Version) ? "1.0.0" : mod.Version,
                     optional = mod.Optional,
                     domainName = string.IsNullOrWhiteSpace(mod.DomainName) ? manifestInfo.domainName : mod.DomainName,
-                    author = string.IsNullOrWhiteSpace(mod.Author) ? null : mod.Author,
                     source = new ManifestModSource
                     {
                         type = mod.Source.Type,
                         modId = mod.Source.ModId,
                         fileId = mod.Source.FileId,
-                        updatePolicy = mod.Source.UpdatePolicy,
-                        logicalFilename = string.IsNullOrWhiteSpace(mod.Source.LogicalFilename) ? null : mod.Source.LogicalFilename,
-
-                        // off-site fields
+                        updatePolicy = "prefer",
                         url = mod.Source.Url,
-                        md5 = mod.Source.Md5,
-                        fileSize = mod.Source.FileSize > 0 ? mod.Source.FileSize : null,
-                        instructions = null,
+                        // Do NOT include fileSize, logicalFilename, md5, tag, or instructions
+                        // These fields significantly bloat the JSON and are not needed by Nexus
                     },
                 })
                 .ToList();
@@ -607,7 +676,13 @@ mutation createOrUpdateRevision($collectionData: CollectionPayload!, $uuid: Stri
                     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
                     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
                 });
-
+                // Save the actual GraphQL payload for debugging
+                var debugPath = collectionJsonPath.Parent.Combine($"{collectionJsonPath.FileName.ToString()}_graphql_payload.json");
+                await debugPath.WriteAllTextAsync(serializedRequest);
+                _logger.LogInformation("DEBUG: Saved GraphQL payload to {path}", debugPath);
+                // Log the JSON size for debugging
+                _logger.LogInformation("Manifest JSON size: {size} bytes ({kb} KB), Mod count: {count}, Schema: {schema}",
+                    serializedRequest.Length, serializedRequest.Length / 1024, manifestMods.Count, CollectionSchemaId);
 
                 using var content = new StringContent(
                     serializedRequest,
@@ -624,13 +699,94 @@ mutation createOrUpdateRevision($collectionData: CollectionPayload!, $uuid: Stri
                 request.Headers.TryAddWithoutValidation("Application-Version", "0.0.0");
                 request.Headers.TryAddWithoutValidation("Protocol-Version", "1.5.0");
 
-                var response = await _httpClient.SendAsync(request, token);
-                var responseBody = await response.Content.ReadAsStringAsync(token);
+                using var mutationCts = new CancellationTokenSource(TimeSpan.FromMinutes(15));
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, mutationCts.Token);
 
-                if (!response.IsSuccessStatusCode)
+                using var mutationClient = new HttpClient
                 {
-                    _logger.LogError("GraphQL mutation failed: {status} - {body}", response.StatusCode, responseBody);
-                    return null;
+                    Timeout = Timeout.InfiniteTimeSpan
+                };
+
+                string responseBody;
+
+                try
+                {
+                    var response = await mutationClient.SendAsync(request, linkedCts.Token);
+                    responseBody = await response.Content.ReadAsStringAsync(linkedCts.Token);
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        _logger.LogError("GraphQL mutation failed: {status} - {body}", response.StatusCode, responseBody);
+
+                        if (response.StatusCode == System.Net.HttpStatusCode.GatewayTimeout)
+                        {
+                            // On first 504, immediately check if collection was created
+                            _logger.LogInformation("Gateway timeout on attempt {attempt} - checking if collection was created...", attempt);
+
+                            // Wait a bit for Nexus to finish processing
+                            await Task.Delay(TimeSpan.FromSeconds(15), token);
+
+                            var existingCollection = await FindRecentlyCreatedCollection(
+                                collectionPayload.Info.Name,
+                                collectionPayload.Info.DomainName,
+                                accessToken,
+                                token);
+
+                            if (existingCollection != null)
+                            {
+                                _logger.LogWarning("Collection was created successfully despite timeout! Using collection ID {id}",
+                                    existingCollection.CollectionId);
+                                return existingCollection;
+                            }
+
+                            // If not found and we have retries left, wait before retry
+                            if (attempt < 3)
+                            {
+                                var delaySeconds = 20;
+                                _logger.LogWarning("Collection not found yet, waiting {delay}s before retry {nextAttempt}/3...",
+                                    delaySeconds, attempt + 1);
+                                await Task.Delay(TimeSpan.FromSeconds(delaySeconds), token);
+                                continue;
+                            }
+
+                            _logger.LogError("Collection creation failed after 3 attempts with timeouts");
+                            return null;
+                        }
+
+                        return null;
+                    }
+                }
+                catch (TaskCanceledException) when (attempt < 3)
+                {
+                    _logger.LogInformation("Request cancelled on attempt {attempt} - checking if collection was created...", attempt);
+                    await Task.Delay(TimeSpan.FromSeconds(15), token);
+
+                    var existingCollection = await FindRecentlyCreatedCollection(
+                        collectionPayload.Info.Name,
+                        collectionPayload.Info.DomainName,
+                        accessToken,
+                        token);
+
+                    if (existingCollection != null)
+                    {
+                        _logger.LogWarning("Collection was created successfully despite cancellation! Using collection ID {id}",
+                            existingCollection.CollectionId);
+                        return existingCollection;
+                    }
+
+                    _logger.LogWarning("Mutation attempt {attempt} timed out, retrying in 20s...", attempt);
+                    await Task.Delay(TimeSpan.FromSeconds(20), token);
+                    continue;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error during mutation attempt {attempt}", attempt);
+                    if (attempt < 3)
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(20), token);
+                        continue;
+                    }
+                    throw;
                 }
 
                 // If there are errors, attempt to detect and remove invalid mod entries.
@@ -641,7 +797,6 @@ mutation createOrUpdateRevision($collectionData: CollectionPayload!, $uuid: Stri
                     if (errors is { Count: > 0 })
                     {
                         _logger.LogError("GraphQL returned errors during {op}: {errors}", operationName, errors.ToJsonString());
-                        _logger.LogError("GraphQL error response body during {op}: {body}", operationName, responseBody);
 
                         var removedAny = TryRemoveInvalidModsFromErrors(errors, ref manifestMods);
                         if (removedAny)
@@ -684,6 +839,8 @@ mutation createOrUpdateRevision($collectionData: CollectionPayload!, $uuid: Stri
                     _logger.LogError("Mutation result not found in response");
                     return null;
                 }
+
+                _logger.LogInformation("Collection mutation succeeded on attempt {attempt}!", attempt);
 
                 return new CollectionUploadResult
                 {
@@ -758,8 +915,228 @@ mutation createOrUpdateRevision($collectionData: CollectionPayload!, $uuid: Stri
             value = default;
             return false;
         }
-    }
 
+
+        private async Task<CollectionUploadResult?> FindRecentlyCreatedCollection(
+            string collectionName,
+            string domainName,
+            string accessToken,
+            CancellationToken token)
+        {
+            try
+            {
+                _logger.LogInformation("Searching for collection '{name}' in domain '{domain}'...", collectionName, domainName);
+
+                var targetName = collectionName.Length > 36 ? collectionName.Substring(0, 36) : collectionName;
+
+                // Poll for up to 90 seconds with  intervals
+                var deadline = DateTime.UtcNow.AddSeconds(90);
+                var attempt = 0;
+
+                while (DateTime.UtcNow < deadline)
+                {
+                    attempt++;
+
+                    var found = await FindRecentlyCreatedCollection_MyCollectionsSafeList(
+                        targetName,
+                        domainName,
+                        accessToken,
+                        token);
+
+                    if (found != null)
+                        return found;
+
+                    // Start with 5s delay, increase to max 15s
+                    var delay = TimeSpan.FromSeconds(Math.Min(5 + (attempt * 2), 15));
+                    _logger.LogInformation("Collection not visible yet; will re-check in {seconds}s (attempt {attempt})",
+                        delay.TotalSeconds, attempt);
+
+                    await Task.Delay(delay, token);
+                }
+
+                _logger.LogWarning("No recent collection found matching name '{name}' in domain '{domain}' within 90 second window",
+                    targetName, domainName);
+
+                return null;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error searching for existing collection");
+                return null;
+            }
+        }
+
+        private async Task<CollectionUploadResult?> FindRecentlyCreatedCollection_MyCollectionsSafeList(
+            string targetName,
+            string domainName,
+            string accessToken,
+            CancellationToken token)
+        {
+            var query = @"
+                query myCollections($count: Int!, $offset: Int!, $viewAdultContent: Boolean!, $viewUnlisted: Boolean!, $viewUnderModeration: Boolean!) {
+                  myCollections(
+                    count: $count,
+                    offset: $offset,
+                    viewAdultContent: $viewAdultContent,
+                    viewUnlisted: $viewUnlisted,
+                    viewUnderModeration: $viewUnderModeration,
+                    sortBy: ""created_at"",
+                    sortDirection: ""DESC""
+                  ) {
+                    nodes {
+                      id
+                      slug
+                      name
+                      game { domainName }
+                      draftRevisionNumber
+                      publishedAt
+                    }
+                  }
+                }";
+
+            var variables = new
+            {
+                count = 50,
+                offset = 0,
+                viewAdultContent = true,
+                viewUnlisted = true,
+                viewUnderModeration = true
+            };
+
+            var graphqlRequest = new { query, variables };
+
+            using var content = new StringContent(
+                JsonSerializer.Serialize(graphqlRequest, new JsonSerializerOptions
+                {
+                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                }),
+                Encoding.UTF8,
+                "application/json");
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, GraphQLUrl)
+            {
+                Content = content
+            };
+
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+            request.Headers.TryAddWithoutValidation("Application-Name", "Wabbajack");
+            request.Headers.TryAddWithoutValidation("Application-Version", "0.0.0");
+            request.Headers.TryAddWithoutValidation("Protocol-Version", "1.5.0");
+
+            var response = await _httpClient.SendAsync(request, token);
+            var responseBody = await response.Content.ReadAsStringAsync(token);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("myCollections request failed: {status} - {body}", response.StatusCode, responseBody);
+                return null;
+            }
+
+            JsonObject? root;
+            try
+            {
+                root = JsonNode.Parse(responseBody) as JsonObject;
+            }
+            catch (Exception parseEx)
+            {
+                _logger.LogWarning(parseEx, "myCollections returned unparseable JSON");
+                return null;
+            }
+
+            var errors = root?["errors"] as JsonArray;
+            if (errors is { Count: > 0 })
+            {
+                _logger.LogWarning("GraphQL errors from myCollections: {errors}", errors.ToJsonString());
+            }
+
+            var nodes = root?["data"]?["myCollections"]?["nodes"] as JsonArray;
+            if (nodes == null || nodes.Count == 0)
+            {
+                _logger.LogDebug("myCollections returned 0 nodes");
+                return null;
+            }
+
+            _logger.LogDebug("myCollections returned {count} nodes; scanning for match", nodes.Count);
+
+            // Because sorted by created_at DESC, first match is most recent
+            foreach (var node in nodes)
+            {
+                if (node is not JsonObject obj)
+                    continue;
+
+                var name = obj["name"]?.GetValue<string>();
+                var gameDomain = obj["game"]?["domainName"]?.GetValue<string>();
+                var slug = obj["slug"]?.GetValue<string>();
+                var collectionIdValue = ParseIntId(obj["id"]);
+
+                if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(gameDomain))
+                    continue;
+
+                if (!name.Equals(targetName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!gameDomain.Equals(domainName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var draftRev = obj["draftRevisionNumber"]?.GetValue<int?>() ?? 1;
+
+                _logger.LogInformation("Found matching collection: id={id} slug='{slug}' draftRev={draftRev}",
+                    collectionIdValue, slug, draftRev);
+
+                return new CollectionUploadResult
+                {
+                    CollectionId = collectionIdValue,
+                    Slug = slug ?? "",
+                    RevisionId = 0,
+                    RevisionNumber = draftRev,
+                    Success = true
+                };
+            }
+
+            return null;
+        }
+
+        private static int ParseIntId(JsonNode? idNode)
+        {
+            try
+            {
+                if (idNode == null) return 0;
+
+                if (idNode is JsonValue jv)
+                {
+                    if (jv.TryGetValue<int>(out var i)) return i;
+
+                    if (jv.TryGetValue<long>(out var l))
+                    {
+                        if (l > int.MaxValue) return 0;
+                        return (int)l;
+                    }
+
+                    if (jv.TryGetValue<string>(out var s))
+                    {
+                        if (int.TryParse(s, out var parsedInt)) return parsedInt;
+                        if (long.TryParse(s, out var parsedLong))
+                        {
+                            if (parsedLong > int.MaxValue) return 0;
+                            return (int)parsedLong;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // ignored
+            }
+
+            return 0;
+        }
+
+    }
     public class PreSignedUrlResult
     {
         [JsonPropertyName("url")]
@@ -839,5 +1216,74 @@ mutation createOrUpdateRevision($collectionData: CollectionPayload!, $uuid: Stri
         public int RevisionId { get; set; }
         public int RevisionNumber { get; set; }
         public bool Success { get; set; }
+    }
+
+    public class ProgressStream : Stream
+    {
+        private readonly Stream _baseStream;
+        private readonly long _totalLength;
+        private readonly Action<long, long> _progressCallback;
+        private long _bytesRead;
+        private DateTime _lastReport = DateTime.MinValue;
+
+        public ProgressStream(Stream baseStream, long totalLength, Action<long, long> progressCallback)
+        {
+            _baseStream = baseStream;
+            _totalLength = totalLength;
+            _progressCallback = progressCallback;
+        }
+
+        public override bool CanRead => _baseStream.CanRead;
+        public override bool CanSeek => _baseStream.CanSeek;
+        public override bool CanWrite => false;
+        public override long Length => _baseStream.Length;
+        public override long Position
+        {
+            get => _baseStream.Position;
+            set => _baseStream.Position = value;
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var bytesRead = _baseStream.Read(buffer, offset, count);
+            _bytesRead += bytesRead;
+
+            // Report every 100ms to avoid overwhelming the UI
+            if ((DateTime.Now - _lastReport).TotalMilliseconds > 100)
+            {
+                _progressCallback(_bytesRead, _totalLength);
+                _lastReport = DateTime.Now;
+            }
+
+            return bytesRead;
+        }
+
+        public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            var bytesRead = await _baseStream.ReadAsync(buffer, offset, count, cancellationToken);
+            _bytesRead += bytesRead;
+
+            if ((DateTime.Now - _lastReport).TotalMilliseconds > 100)
+            {
+                _progressCallback(_bytesRead, _totalLength);
+                _lastReport = DateTime.Now;
+            }
+
+            return bytesRead;
+        }
+
+        public override void Flush() => _baseStream.Flush();
+        public override long Seek(long offset, SeekOrigin origin) => _baseStream.Seek(offset, origin);
+        public override void SetLength(long value) => _baseStream.SetLength(value);
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _progressCallback(_bytesRead, _totalLength);
+            }
+            base.Dispose(disposing);
+        }
     }
 }
